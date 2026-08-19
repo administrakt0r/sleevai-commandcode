@@ -1,16 +1,17 @@
-# sleev-cmdcode
+# sleevai-commandcode
 
-**Wire [Sleev.ai](https://sleev.ai) compression and session tracking into [Command Code](https://commandcode.ai) in under 60 seconds.**
+**Wire [Sleev.ai](https://sleev.ai) compression and session tracking into [Command Code](https://commandcode.ai) — automatic, zero-touch, with native API fallback.**
 
-Sleev is a local AI gateway proxy that sits between your coding agent and LLM providers. It compresses requests, tracks sessions, and routes to upstream providers — saving tokens and adding observability. This mod plugs it directly into Command Code.
+Sleev is a local AI gateway proxy that sits between your coding agent and LLM providers. It compresses requests, tracks sessions, and routes to upstream providers. This integration plugs it directly into Command Code via a lightweight proxy + mod combo.
 
 ## What you get
 
 - **Parallel request compression** — sleev intercepts and compresses context before it hits the model, reducing token usage
 - **Session tracking** — fingerprint-based session routing with full request/response logging
-- **Provider routing** — prefix any model with `sleev/` and sleev handles upstream routing automatically
-- **Zero config after setup** — the mod auto-loads on every Command Code session
-- **`/sleev` command** — check gateway status from inside a session
+- **Automatic provider routing** — the proxy detects the upstream provider from the model name and sets the correct `sleev-provider` header
+- **Native API fallback** — Command Code-specific models (e.g. `poolside/laguna-s-2.1-free`) automatically fall back to `api.commandcode.ai` when sleev doesn't support them
+- **`/sleev` command** — check gateway status from inside a Command Code session
+- **Zero config after install** — the proxy runs as a systemd service and `COMMANDCODE_API_URL` is set in your shell profile
 
 ## Prerequisites
 
@@ -23,17 +24,17 @@ Sleev is a local AI gateway proxy that sits between your coding agent and LLM pr
 Verify your setup:
 
 ```bash
-node --version          # v22.x.x or higher
-cmd --version           # Command Code version
-sleev --version         # Sleev CLI version
+node --version                    # v22.x.x or higher
+cmd --version                     # Command Code version
+sleev --version                   # Sleev CLI version
 systemctl --user is-active sleeve-gateway  # should print "active"
 ```
 
 ## Quick install
 
 ```bash
-git clone https://github.com/administrakt0r/sleev-cmdcode.git
-cd sleev-cmdcode
+git clone https://github.com/administrakt0r/sleevai-commandcode.git
+cd sleevai-commandcode
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -41,87 +42,139 @@ chmod +x setup.sh
 The setup script:
 1. Checks all prerequisites
 2. Copies the mod to `~/.commandcode/mods/sleev-gateway.ts`
-3. Registers `commandcode` as a harness in `~/.config/sleev/config.json`
-4. Verifies the installation
+3. Installs the proxy script to `~/.commandcode/mods/sleev-proxy.js`
+4. Creates a systemd user service (`sleev-proxy`) that auto-starts on boot
+5. Sets `COMMANDCODE_API_URL=http://127.0.0.1:18080` in your shell profile
+6. Registers `commandcode` as a harness in sleev's config
 
 ## Manual install
 
-If you prefer to install by hand:
-
-### 1. Copy the mod
+### 1. Copy the files
 
 ```bash
 mkdir -p ~/.commandcode/mods
-cp mods/sleev-gateway.ts ~/.commandcode/mods/sleev-gateway.ts
+cp mods/sleev-gateway.ts   ~/.commandcode/mods/sleev-gateway.ts
+cp mods/sleev-proxy.js     ~/.commandcode/mods/sleev-proxy.js
 ```
 
-### 2. Register the harness
+### 2. Start the proxy
 
-Add `"commandcode": { "configured": true }` to the `harnesses` section in `~/.config/sleev/config.json`:
+```bash
+# Option A: systemd service (recommended, survives reboots)
+mkdir -p ~/.config/systemd/user
+sed 's|%h|'"$HOME"'|g' mods/sleev-proxy.service | \
+  sed "s|ExecStart=/usr/bin/node|ExecStart=$(which node)|g" \
+  > ~/.config/systemd/user/sleev-proxy.service
+systemctl --user daemon-reload
+systemctl --user enable --now sleev-proxy
 
-```json
-{
-  "harnesses": {
-    "opencode": { "configured": true },
-    "commandcode": { "configured": true }
-  }
-}
+# Option B: run directly (temporary)
+node ~/.commandcode/mods/sleev-proxy.js &
 ```
 
-### 3. Verify
+### 3. Set the environment variable
+
+```bash
+echo 'export COMMANDCODE_API_URL=http://127.0.0.1:18080' >> ~/.bashrc
+# or ~/.zshrc
+source ~/.bashrc
+```
+
+### 4. Verify
 
 ```bash
 cmd mods list
 # Should show: sleev-gateway · user · ~/.commandcode/mods/sleev-gateway.ts
+
+curl -s http://127.0.0.1:18080/  # proxy should respond
+systemctl --user is-active sleev-proxy  # should print "active"
 ```
 
 ## Usage
 
-Prefix any model ID with `sleev/` to route through the gateway:
+After setup, **all** your Command Code models automatically route through sleev when the proxy is running:
 
 ### Interactive mode
 
-```
+```bash
 cmd
-/model sleev/xiaomi/mimo-v2.5-pro
-> your prompt here
+# Everything you type now uses sleev compression
+> explain this codebase
 ```
 
-### From the command line
+Inside a session:
+
+```
+/sleev    # Check gateway status and supported models
+```
+
+### Command line
 
 ```bash
-cmd --model sleev/xiaomi/mimo-v2.5-pro -p "explain this codebase"
-cmd --model sleev/claude-sonnet-5 -p "refactor this function"
-cmd --model sleev/gpt-5.6-luna -p "write tests for this module"
+# Uses sleev (compression + session tracking enabled)
+cmd -p "What is 2+2?"
+
+# Explicit model
+cmd --model mimo-v2.5-free -p "refactor this function"
+cmd --model claude-sonnet-5 -p "write tests"
+cmd --model gpt-5.6-luna -p "explain this codebase"
 ```
 
-### Check gateway status
+### Model fallback behavior
 
-Inside a Command Code session:
+| Model | Routing |
+|---|---|
+| `mimo-v2.5-free` | → sleev → mimo upstream |
+| `claude-sonnet-5` | → sleev → anthropic upstream |
+| `gpt-5.6-luna` | → sleev → openai upstream |
+| `poolside/laguna-s-2.1-free` | → native Command Code API (fallback) |
+| `command-code` provider | → native Command Code API (fallback) |
+
+## How it works
 
 ```
-/sleev
+┌─────────────────┐    COMMANDCODE_API_URL     ┌──────────────────┐
+│  Command Code   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶ │  sleev-proxy      │
+│  (built-in      │     http://127.0.0.1:18080 │  port 18080       │
+│   gateway)      │                            │  (injects headers)│
+└─────────────────┘    ◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │                   │
+                                                └────────│────────┘
+                                                          │
+         ┌────────────────────────────────────────────────┘
+         │         if model maps to a sleev provider
+         ▼                                                 if not (fallback)
+┌──────────────────┐       ┌─────────────┐     ┌──────────────┐  │
+│  sleev-gateway    │ ─ ─▶│  Sleev.ai   │ ─ ─▶│  LLM Provider │  │
+│  localhost:17321  │     │  Cloud      │     │  (upstream)   │  │
+│  (compression,    │ ◀ ─ │  (routing,  │ ◀ ─ │  OpenAI etc.) │  │
+│   sessions)       │     │   logging)  │     │               │  │
+└──────────────────┘     └─────────────┘     └──────────────┘  │
+                                                                 │
+┌──────────────────┐                                           │
+│  api.commandcode  │ ◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+│  .ai (fallback)   │
+└──────────────────┘
 ```
 
-Output:
-```
-Sleev Gateway: active on http://127.0.0.1:17321
-Harness: commandcode
-Compression: parallel
+### Request flow
 
-Usage: prefix model with "sleev/" to route through gateway
-  /model sleev/xiaomi/mimo-v2.5-pro
-  /model sleev/claude-sonnet-5
-  cmd --model sleev/gpt-5.6-luna
-```
+1. Command Code sends API requests to `COMMANDCODE_API_URL` (the proxy on port 18080)
+2. The proxy inspects the request body for the model name
+3. If the model maps to a sleev-supported provider, the proxy adds `sleev-harness: commandcode` and `sleev-provider: <provider>` headers and forwards to the sleev gateway (port 17321)
+4. Sleev applies parallel compression, session tracking, and routes to the upstream provider
+5. If the model is Command Code-specific (not recognized by sleev), the proxy forwards to `api.commandcode.ai` without sleev headers — native behavior preserved
+
+### Why a proxy?
+
+Command Code's built-in provider uses a "gateway" transport that routes through `api.commandcode.ai`. The gateway transport does not support custom HTTP headers, which sleev requires (`sleev-harness` and `sleev-provider`). The lightweight proxy sits in front of the sleev gateway and injects these headers, while transparently falling back to Command Code's native API for models sleev doesn't support.
 
 ## Supported models
 
-Any model that sleev supports works. The mod auto-resolves the upstream provider from the model name:
+The proxy auto-detects the upstream provider from the model name. Any model from the following providers works with sleev compression:
 
-| Prefix / Org | Upstream Provider |
+| Model prefix / org | Upstream provider |
 |---|---|
-| `gpt-*`, `o1-*`, `o3-*` | OpenAI |
+| `gpt-*` | OpenAI |
 | `claude-*` | Anthropic |
 | `grok-*` | xAI |
 | `gemini-*` | Google |
@@ -131,53 +184,23 @@ Any model that sleev supports works. The mod auto-resolves the upstream provider
 | `Qwen-*` | Alibaba/Qwen |
 | `zai-org/*`, `GLM-*` | Zhipu/GLM |
 | `MiniMax-*` | MiniMax |
-| `meta/*`, `muse-*` | Meta |
-| `xai/*` | xAI |
-| `google/*` | Google |
-
-See the full list in the [mod source](mods/sleev-gateway.ts).
-
-## How it works
-
-```
-Command Code ──► sleev-gateway mod ──► localhost:17321 ──► sleev.ai cloud ──► LLM provider
-                    (this mod)          (sleev gateway)     (compression)      (OpenAI, etc.)
-```
-
-1. The mod registers a `sleev` provider in Command Code's mod system using `cmd.addProvider()`
-2. When you use `sleev/<model>`, Command Code sends the request to the local sleev gateway on port 17321
-3. Sleev detects the request format (chat completions), applies parallel compression, tracks the session, and forwards to the upstream provider
-4. Responses flow back through the same path with decompression
-
-The mod uses the `commandcode` harness ID, which is registered in sleev's config during setup. This is the same pattern that sleev uses for opencode and other supported tools.
-
-## Architecture
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Command Code   │────▶│  Sleev Gateway   │────▶│  Sleev.ai   │────▶│  LLM Provider│
-│  + sleev mod    │     │  localhost:17321  │     │  Cloud      │     │  (upstream)  │
-│                 │◀────│                  │◀────│             │◀────│              │
-└─────────────────┘     └──────────────────┘     └─────────────┘     └──────────────┘
-   sleev/model-id         format detection         compression         OpenAI / Anthropic
-   headers injected       session tracking         session mgmt        Moonshot / xAI / ...
-```
-
-## Uninstall
-
-```bash
-rm ~/.commandcode/mods/sleev-gateway.ts
-```
-
-Then remove the `"commandcode"` entry from `~/.config/sleev/config.json` if desired.
+| `meta-llama/*`, `muse-*` | Meta |
+| `nvidia/*` | NVIDIA |
+| `thinkingmachines/Inkling` | Thinking Machines |
 
 ## Troubleshooting
 
 **Mod not loading:**
 ```bash
 cmd mods list
-# If missing, check the file exists:
-ls -la ~/.commandcode/mods/sleev-gateway.ts
+# If missing, check: ls -la ~/.commandcode/mods/sleev-gateway.ts
+```
+
+**Proxy not responding:**
+```bash
+systemctl --user status sleev-proxy
+systemctl --user restart sleev-proxy
+journalctl --user -u sleev-proxy -n 20
 ```
 
 **Gateway not running:**
@@ -186,27 +209,44 @@ systemctl --user status sleeve-gateway
 systemctl --user restart sleeve-gateway
 ```
 
-**Requests failing:**
-```bash
-# Check sleev auth
-sleev auth
+**Model not routing through sleev:**
+- Check `/sleev` inside a Command Code session — it shows which models are sleev-compatible
+- Add the model prefix to `PROVIDER_PATTERNS` in `mods/sleev-proxy.js`
 
-# Check gateway logs
-tail -50 ~/.local/state/sleev/debug-logs/server/gateway.err.log
+**Check if compression is active:**
+```bash
+# Look for compression entries in the latest debug log
+dir=$(ls -dt ~/.local/state/sleev/debug-logs/http/*/ | head -1)
+grep -ri "compress" "$dir" | tail -5
 ```
 
-**Model not routing correctly:**
-The mod auto-resolves providers from model names. If your model isn't mapped, open an issue or edit the `PROVIDER_PREFIXES` / `FULL_MODEL_MAP` objects in the mod file.
+**Sleev auth expired:**
+```bash
+sleev auth
+```
 
 ## Files
 
 ```
 .
-├── README.md               # This file
-├── setup.sh                # Automated setup script
-├── LICENSE                 # MIT license
+├── README.md                   # This file
+├── setup.sh                    # Automated setup script
+├── LICENSE                     # MIT license
 └── mods/
-    └── sleev-gateway.ts    # The Command Code mod
+    ├── sleev-gateway.ts        # Command Code mod (provides /sleev command)
+    ├── sleev-proxy.js          # Node.js proxy (injects sleev headers, fallback routing)
+    └── sleev-proxy.service     # systemd user service file for the proxy
+```
+
+## Uninstall
+
+```bash
+rm ~/.commandcode/mods/sleev-gateway.ts
+rm ~/.commandcode/mods/sleev-proxy.js
+systemctl --user stop sleev-proxy
+systemctl --user disable sleev-proxy
+rm ~/.config/systemd/user/sleev-proxy.service
+# Remove COMMANDCODE_API_URL from ~/.bashrc or ~/.zshrc
 ```
 
 ## License

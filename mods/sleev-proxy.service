@@ -1,0 +1,16 @@
+[Unit]
+Description=Sleev.ai Proxy for Command Code
+After=network.target sleeve-gateway.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.commandcode/mods/sleev-proxy.js
+Restart=on-failure
+RestartSec=5
+Environment=SLEEV_GATEWAY_URL=http://127.0.0.1:17321
+Environment=SLEEV_HARNESS=commandcode
+Environment=SLEEV_PROXY_PORT=18080
+Environment=COMMANDCODE_FALLBACK_URL=https://api.commandcode.ai
+
+[Install]
+WantedBy=default.target
